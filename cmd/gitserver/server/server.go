@@ -4,6 +4,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,6 +29,7 @@ import (
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 
 	"github.com/sourcegraph/sourcegraph/internal/actor"
@@ -107,6 +109,55 @@ func runCommand(ctx context.Context, cmd *exec.Cmd) (exitCode int, err error) {
 	return exitStatus, err
 }
 
+// TODO:
+type cloneJob struct {
+	repo   api.RepoName
+	dir    GitDir
+	syncer VCSSyncer
+
+	// TODO: cloneWorker should acquire a new lock. For now leave this as is for quick
+	// testing. Cannot merge without this change.
+	lock *RepositoryLock
+
+	remoteURL *vcs.URL
+	options   *cloneOptions
+}
+
+// cloneList is a threadsafe list of cloneJobs.
+type cloneList struct {
+	mu sync.RWMutex
+
+	jobs *list.List
+}
+
+// Add will add the cloneJob to the end of the list.
+func (c *cloneList) Add(cj *cloneJob) *list.Element {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.jobs.PushBack(cj)
+}
+
+// Next will return the next cloneJob. If there's no next job available, it returns nil.
+func (c *cloneList) Next() *cloneJob {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	next := c.jobs.Front()
+	if next == nil {
+		return nil
+	}
+
+	return c.jobs.Remove(next).(*cloneJob)
+}
+
+// NewCloneList initializes a new cloneList.
+func NewCloneList() *cloneList {
+	return &cloneList{
+		jobs: list.New(),
+	}
+}
+
 // Server is a gitserver server.
 type Server struct {
 	// ReposDir is the path to the base directory for gitserver storage.
@@ -141,8 +192,10 @@ type Server struct {
 	// shared db handle
 	DB dbutil.DB
 
-	// TODO:
-	// CloneList: A threadsafe type using container/list
+	// TODO: Rename to CloneQueue
+	CloneList *cloneList
+
+	NewCloneJobReady chan struct{}
 
 	// skipCloneForTests is set by tests to avoid clones.
 	skipCloneForTests bool
@@ -329,6 +382,78 @@ func (s *Server) SyncRepoState(interval time.Duration, batchSize, perSecond int)
 
 		time.Sleep(interval)
 	}
+}
+
+func (s *Server) DoBackgroundClones() error {
+	maxCloneWorkers := conf.Get().GitMaxConcurrentClones
+
+	g, ctx := errgroup.WithContext(context.Background())
+
+	jobs := make(chan *cloneJob, maxCloneWorkers)
+
+	// Start "GitMaxConcurrentClones" number of worker goroutines.
+	for i := 0; i < maxCloneWorkers; i++ {
+		g.Go(func() error {
+			return s.cloneWorker(ctx, jobs)
+		})
+	}
+
+	g.Go(func() error {
+		return s.cloneJobProducer(ctx, jobs)
+	})
+
+	// Wait for all the cloneWorkers and the standalone cloneJobProducer
+	if err := g.Wait(); err != nil {
+		// TODO: Maybe just log this and attempt to restart the DoBackgroundClones goroutine.
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) cloneJobProducer(ctx context.Context, jobs chan<- *cloneJob) error {
+	defer close(jobs)
+
+	for {
+		job := s.CloneList.Next()
+		if job != nil {
+			select {
+			case jobs <- job:
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		for {
+			// We didn't find any new jobs. So instead of checking again, we wait for a signal.
+			select {
+			// Block until a new cloneJob is available to be processed.
+			case <-s.NewCloneJobReady:
+				continue
+			}
+		}
+	}
+}
+
+func (s *Server) cloneWorker(ctx context.Context, jobs <-chan *cloneJob) error {
+	for j := range jobs {
+		log15.Info("cloneWorker is processing jobs")
+		err := s.doClone(ctx, j.repo, j.dir, j.syncer, j.lock, j.remoteURL, j.options)
+		if err != nil {
+			log15.Error("failed to clone repo", "repo", j.repo, "error", err)
+			// Add it back to the list of cloneJobs.
+			s.CloneList.Add(j)
+			log15.Info("requeued repo for cloning", "repo", j.repo)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return nil
 }
 
 // hostnameMatch checks whether the hostname matches the given address.
@@ -1294,21 +1419,46 @@ func (s *Server) cloneRepo(ctx context.Context, repo api.RepoName, opts *cloneOp
 	}
 
 	// TODO: Stop creating this goroutine here.
-	go func() {
-		// Create a new context because this is in a background goroutine.
-		ctx, cancel := s.serverContext()
-		defer cancel()
-		err := s.doClone(ctx, repo, dir, syncer, lock, remoteURL, opts)
-		if err != nil {
-			log15.Error("failed to clone repo", "repo", repo, "error", err)
-		}
-		s.setLastErrorNonFatal(ctx, repo, err)
-	}()
+	// TODO: Guard this behind a feature flag.
+	// go func() {
+	// 	// Create a new context because this is in a background goroutine.
+	// 	ctx, cancel := s.serverContext()
+	// 	defer cancel()
+	// 	err := s.doClone(ctx, repo, dir, syncer, lock, remoteURL, opts)
+	// 	if err != nil {
+	// 		log15.Error("failed to clone repo", "repo", repo, "error", err)
+	// 	}
+	s.setLastErrorNonFatal(ctx, repo, err)
+	// }()
 
 	// Instead: Append "job" to s.CloneList and return.  A job contains all the information that we
 	// currently pass to the doClone method.  A producer-consumer pipeline will ensure that we have
 	// long lived GIT_MAX_CONCURRENT_CLONES goroutines that accept clone jobs and prevents cloneRepo
 	// from blocking.
+
+	sendNewJobSignal := false
+	if s.CloneList.jobs.Len() == 0 {
+		sendNewJobSignal = true
+	}
+
+	element := s.CloneList.Add(&cloneJob{
+		repo:      repo,
+		dir:       dir,
+		syncer:    syncer,
+		lock:      lock,
+		remoteURL: remoteURL,
+		options:   opts,
+	})
+
+	log15.Info("added repo to clonelist: %#v", element.Value.(*cloneJob))
+
+	// TODO: Ensure if this is a good idea.
+	if sendNewJobSignal {
+		go func() {
+			s.NewCloneJobReady <- struct{}{}
+		}()
+	}
+
 	return "", nil
 }
 

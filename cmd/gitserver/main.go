@@ -179,8 +179,7 @@ func main() {
 		Hostname: hostname.Get(),
 		DB:       db,
 		// TODO:
-		// CloneList: A Threadsafe list using container/list.
-
+		CloneList: server.NewCloneList(),
 	}
 	gitserver.RegisterMetrics()
 
@@ -207,7 +206,10 @@ func main() {
 	// TODO: We spawn a "manager" goroutine here that clones repos in the background. Exact
 	// architecture of this pipeline is not yet clear at this point.
 	//
-	// go gitserver.DoBackgroundClones()
+
+	// TODO: Guard this behind a config variable.
+	// TODO: DoBackgroundClones returns an error. We need to catch it.
+	go gitserver.DoBackgroundClones()
 
 	port := "3178"
 	host := ""
