@@ -141,12 +141,3 @@ func (h *dependencyIndexingSchedulerHandler) shouldIndexDependencies(ctx context
 
 	return upload.Indexer == "lsif-go" || upload.Indexer == "lsif-java", nil
 }
-
-func kindExists(kinds []string, kind string) bool {
-	for _, k := range kinds {
-		if k == kind {
-			return true
-		}
-	}
-	return false
-}
