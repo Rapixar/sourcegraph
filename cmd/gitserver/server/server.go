@@ -141,6 +141,9 @@ type Server struct {
 	// shared db handle
 	DB dbutil.DB
 
+	// TODO:
+	// CloneList: A threadsafe type using container/list
+
 	// skipCloneForTests is set by tests to avoid clones.
 	skipCloneForTests bool
 
@@ -1290,6 +1293,7 @@ func (s *Server) cloneRepo(ctx context.Context, repo api.RepoName, opts *cloneOp
 		return "", err
 	}
 
+	// TODO: Stop creating this goroutine here.
 	go func() {
 		// Create a new context because this is in a background goroutine.
 		ctx, cancel := s.serverContext()
@@ -1301,6 +1305,10 @@ func (s *Server) cloneRepo(ctx context.Context, repo api.RepoName, opts *cloneOp
 		s.setLastErrorNonFatal(ctx, repo, err)
 	}()
 
+	// Instead: Append "job" to s.CloneList and return.  A job contains all the information that we
+	// currently pass to the doClone method.  A producer-consumer pipeline will ensure that we have
+	// long lived GIT_MAX_CONCURRENT_CLONES goroutines that accept clone jobs and prevents cloneRepo
+	// from blocking.
 	return "", nil
 }
 
