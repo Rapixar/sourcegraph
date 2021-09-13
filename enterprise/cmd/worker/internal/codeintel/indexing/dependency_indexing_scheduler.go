@@ -7,8 +7,10 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/go-multierror"
 
+	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/autoindex/enqueuer"
 	"github.com/sourcegraph/sourcegraph/enterprise/internal/codeintel/stores/dbstore"
 	"github.com/sourcegraph/sourcegraph/internal/actor"
+	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/database"
 	"github.com/sourcegraph/sourcegraph/internal/workerutil"
 	"github.com/sourcegraph/sourcegraph/internal/workerutil/dbworker"
@@ -22,6 +24,7 @@ func NewDependencyIndexingScheduler(
 	dbStore DBStore,
 	workerStore dbworkerstore.Store,
 	externalServiceStore ExternalServiceStore,
+	gitserver GitserverClient,
 	enqueuer IndexEnqueuer,
 	pollInterval time.Duration,
 	numProcessorRoutines int,
@@ -50,6 +53,7 @@ type dependencyIndexingSchedulerHandler struct {
 	indexEnqueuer IndexEnqueuer
 	extsvcStore   ExternalServiceStore
 	workerStore   dbworkerstore.Store
+	gitserver     GitserverClient
 }
 
 var _ workerutil.Handler = &dependencyIndexingSchedulerHandler{}
@@ -99,6 +103,8 @@ func (h *dependencyIndexingSchedulerHandler) Handle(ctx context.Context, record 
 		}
 	}()
 
+	repoToPackages := make(map[api.RepoName][]precise.Package)
+	var repoNames []api.RepoName
 	for {
 		packageReference, exists, err := scanner.Next()
 		if err != nil {
@@ -114,8 +120,32 @@ func (h *dependencyIndexingSchedulerHandler) Handle(ctx context.Context, record 
 			Version: packageReference.Package.Version,
 		}
 
-		if err := h.indexEnqueuer.QueueIndexesForPackage(ctx, pkg); err != nil {
-			errs = append(errs, errors.Wrap(err, "enqueuer.QueueIndexesForPackage"))
+		name, _, ok := enqueuer.InferRepositoryAndRevision(pkg)
+		if !ok {
+			continue
+		}
+		repoToPackages[api.RepoName(name)] = append(repoToPackages[api.RepoName(name)], pkg)
+		repoNames = append(repoNames, api.RepoName(name))
+	}
+
+	results, err := h.gitserver.RepoInfo(ctx, repoNames...)
+	if err != nil {
+		return err
+	}
+
+	for repo, info := range results {
+		if !info.Cloned && !info.CloneInProgress { // if the repository doesnt exist
+			delete(repoToPackages, repo)
+		} else if info.CloneInProgress { // we can't enqueue if still cloning
+			return h.workerStore.Requeue(ctx, job.ID, time.Now().Add(time.Second*10))
+		}
+	}
+
+	for _, pkgs := range repoToPackages {
+		for _, pkg := range pkgs {
+			if err := h.indexEnqueuer.QueueIndexesForPackage(ctx, pkg); err != nil {
+				errs = append(errs, errors.Wrap(err, "enqueuer.QueueIndexesForPackage"))
+			}
 		}
 	}
 

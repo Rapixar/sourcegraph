@@ -86,7 +86,7 @@ func (j *indexingJob) Routines(ctx context.Context) ([]goroutine.BackgroundRouti
 	routines := []goroutine.BackgroundRoutine{
 		indexing.NewIndexScheduler(dbStoreShim, settingStore, repoStore, indexEnqueuer, indexingConfigInst.AutoIndexingTaskInterval, observationContext),
 		indexing.NewDependencySyncScheduler(dbStoreShim, dependencyIndexStore, extSvcStore, syncMetrics),
-		indexing.NewDependencyIndexingScheduler(dbStoreShim, dependencyIndexQueueingStore, extSvcStore, indexEnqueuer, indexingConfigInst.DependencyIndexerSchedulerPollInterval, indexingConfigInst.DependencyIndexerSchedulerConcurrency, queueingMetrics),
+		indexing.NewDependencyIndexingScheduler(dbStoreShim, dependencyIndexQueueingStore, extSvcStore, gitserverClient, indexEnqueuer, indexingConfigInst.DependencyIndexerSchedulerPollInterval, indexingConfigInst.DependencyIndexerSchedulerConcurrency, queueingMetrics),
 	}
 
 	return routines, nil
